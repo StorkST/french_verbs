@@ -1,0 +1,22 @@
+{
+  "aller": {
+    "familier": false,
+    "soutenu": false
+  },
+  "avoir": {
+    "familier": true,
+    "soutenu": false
+  },
+  "faire": {
+    "familier": true,
+    "soutenu": false
+  },
+  "se faire": {
+    "familier": false,
+    "soutenu": false
+  },
+  "être": {
+    "familier": true,
+    "soutenu": true
+  }
+}
