@@ -10,29 +10,36 @@ detected, the script writes "X" into the `Category_Informal` or
 
 Usage:
     python assign_registers_from_wiktionary.py \
-        --input /path/to/Verbes_en_français-2025-11-09.csv \
-        --output /path/to/Verbes_en_français-annotated.csv
+        --input /path/to/Verbes_en_français-2025-11-09.csv
 
-Key options let you control rate limiting, retries and whether to overwrite
-existing values. See `--help` for details.
+By default the script writes the annotated data to a sibling file whose name
+ends with ``-assign-formal-regs.csv``. Override with ``--output`` if you want a
+different destination. Key options let you control rate limiting, concurrency,
+retries and whether to overwrite existing values. See ``--help`` for details.
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import hashlib
 import logging
 import re
 import sys
 import time
+import threading
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import requests
 
 
 WIKTIONARY_ENDPOINT = "https://fr.wiktionary.org/w/api.php"
+DEFAULT_USER_AGENT = (
+    "RegisterCategoriser/1.1 "
+    "(https://github.com/JobsAround; contact: data-team@jobsaround.example)"
+)
 
 # Map CSV column names to regex patterns that signal the register.
 # Patterns are matched on raw wikitext (lower-cased). They intentionally
@@ -60,6 +67,71 @@ REGISTER_PATTERNS: Dict[str, Iterable[re.Pattern[str]]] = {
 }
 
 
+class RateLimiter:
+    """Thread-safe limiter that enforces a minimum delay between API calls."""
+
+    def __init__(self, min_interval: float) -> None:
+        self.min_interval = max(min_interval, 0.0)
+        self._lock = threading.Lock()
+        self._next_available: float = 0.0
+
+    def wait(self) -> None:
+        if self.min_interval <= 0:
+            return
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                if now >= self._next_available:
+                    self._next_available = now + self.min_interval
+                    return
+                wait_time = self._next_available - now
+            # Sleep outside the lock to allow other threads to progress.
+            time.sleep(wait_time)
+
+
+class ProgressTracker:
+    """Light-weight stderr progress indicator for long-running jobs."""
+
+    def __init__(self, total: int, interval: int = 50) -> None:
+        self.total = total
+        self.interval = max(interval, 1)
+        self.completed = 0
+        self._lock = threading.Lock()
+        self._printed = False
+
+    def advance(self) -> None:
+        with self._lock:
+            self.completed += 1
+            if self.completed % self.interval and self.completed != self.total:
+                return
+            percent = (self.completed / self.total * 100) if self.total else 0.0
+            sys.stderr.write(
+                f"\rProgress: {self.completed}/{self.total} "
+                f"({percent:5.1f}%)"
+            )
+            sys.stderr.flush()
+            self._printed = True
+
+    def finish(self) -> None:
+        with self._lock:
+            if self._printed:
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+                self._printed = False
+
+
+_THREAD_LOCAL = threading.local()
+
+
+def get_session(user_agent: str) -> requests.Session:
+    session = getattr(_THREAD_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"User-Agent": user_agent})
+        _THREAD_LOCAL.session = session
+    return session
+
+
 def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Annotate register columns using French Wiktionary.",
@@ -74,7 +146,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        help="Destination CSV. Defaults to in-place overwrite of --input.",
+        help="Destination CSV. Defaults to <input>-assign-formal-cats.csv.",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help="Number of parallel workers fetching Wiktionary pages.",
     )
     parser.add_argument(
         "--sleep",
@@ -102,6 +180,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--limit",
         type=int,
         help="Stop after processing this many lemmas (for testing).",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=int,
+        default=50,
+        help="Emit a progress update after this many completed lemmas.",
     )
     parser.add_argument(
         "--log-level",
@@ -135,6 +219,7 @@ def load_wikitext(
     delay: float,
     retries: int,
     cache_dir: Optional[Path] = None,
+    rate_limiter: Optional[RateLimiter] = None,
 ) -> Optional[str]:
     """Fetch raw wikitext for a page, optionally using a cache."""
     if cache_dir:
@@ -154,6 +239,8 @@ def load_wikitext(
 
     for attempt in range(1, retries + 1):
         try:
+            if rate_limiter:
+                rate_limiter.wait()
             response = session.get(
                 WIKTIONARY_ENDPOINT,
                 params=params,
@@ -183,7 +270,6 @@ def load_wikitext(
 
         if cache_path:
             cache_path.write_text(wikitext, encoding="utf-8")
-        time.sleep(delay)
         return wikitext
 
     logging.error("Giving up on %s after %s attempts", title, retries)
@@ -199,6 +285,13 @@ def detect_registers(wikitext: str) -> Dict[str, str]:
     for column, patterns in REGISTER_PATTERNS.items():
         if any(pattern.search(wikitext) for pattern in patterns):
             result[column] = "X"
+
+    if result["Category_Informal"] and result["Category_Formal"]:
+        logging.debug(
+            "Both informal and formal markers detected; clearing for neutrality."
+        )
+        for column in result:
+            result[column] = ""
     return result
 
 
@@ -207,19 +300,21 @@ def update_csv(
     output_path: Optional[Path],
     *,
     sleep_seconds: float,
+    workers: int,
+    progress_interval: int,
     max_retries: int,
     overwrite: bool,
     cache_dir: Optional[Path],
     limit: Optional[int],
-) -> None:
+) -> int:
     with input_path.open("r", newline="", encoding="utf-8") as fh:
-        reader = list(csv.reader(fh))
+        rows = list(csv.reader(fh))
 
-    if not reader:
+    if not rows:
         logging.error("Input CSV %s is empty.", input_path)
-        return
+        return 0
 
-    header = reader[0]
+    header = rows[0]
     try:
         lemma_index = header.index("lemme")
     except ValueError as exc:
@@ -227,34 +322,48 @@ def update_csv(
 
     column_indices = ensure_columns(header, REGISTER_PATTERNS.keys())
 
-    session = requests.Session()
-    session.headers.update(
-        {
-            "User-Agent": (
-                "RegisterCategoriser/1.0 "
-                "(https://github.com/JobsAround; contact: data-team@jobsaround.example)"
-            )
-        }
-    )
+    jobs: List[Tuple[int, str]] = []
+    total_rows = len(rows) - 1
+    max_jobs = min(limit, total_rows) if limit is not None else None
+    limit_triggered = False
 
-    processed = 0
-
-    for row_num, row in enumerate(reader[1:], start=2):
+    for row_idx, row in enumerate(rows[1:], start=1):
+        if max_jobs is not None and len(jobs) >= max_jobs:
+            limit_triggered = True
+            break
+        if len(row) < len(header):
+            row.extend([""] * (len(header) - len(row)))
         lemma = row[lemma_index].strip()
         if not lemma:
-            logging.debug("Skipping empty lemma at row %s", row_num)
+            logging.debug("Skipping empty lemma at row %s", row_idx + 1)
             continue
-
-        if limit is not None and processed >= limit:
-            logging.info("Reached processing limit of %s entries.", limit)
-            break
 
         existing_values = {col: row[idx].strip() for col, idx in column_indices.items()}
         if not overwrite and all(existing_values[col] for col in column_indices):
             logging.debug("Skipping %s (already populated).", lemma)
             continue
 
-        logging.info("Processing lemma '%s' (row %s)", lemma, row_num)
+        jobs.append((row_idx, lemma))
+
+    if limit_triggered and max_jobs is not None:
+        logging.info("Reached processing limit of %s entries.", max_jobs)
+
+    workers = max(1, workers)
+    rate_limiter = RateLimiter(sleep_seconds) if sleep_seconds > 0 else None
+
+    progress = ProgressTracker(len(jobs), progress_interval) if jobs else None
+
+    user_agent = DEFAULT_USER_AGENT
+
+    logging.info(
+        "Scheduling %s lemma(s) across %s worker(s) with minimum %.2fs delay.",
+        len(jobs),
+        workers,
+        sleep_seconds,
+    )
+
+    def process_job(row_idx: int, lemma: str) -> Tuple[int, Dict[str, str]]:
+        session = get_session(user_agent)
         title = lemma.replace("’", "'").replace(" ", "_")
         wikitext = load_wikitext(
             title,
@@ -262,25 +371,50 @@ def update_csv(
             delay=sleep_seconds,
             retries=max_retries,
             cache_dir=cache_dir,
+            rate_limiter=rate_limiter,
         )
         registers = detect_registers(wikitext or "")
-        for column, value in registers.items():
-            idx = column_indices[column]
-            if value == "X" or overwrite:
-                row[idx] = value
+        return row_idx, registers
 
-        processed += 1
+    if jobs:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(process_job, row_idx, lemma): row_idx
+                for row_idx, lemma in jobs
+            }
+            for future in as_completed(future_map):
+                row_idx, registers = future.result()
+                row = rows[row_idx]
+                for column, value in registers.items():
+                    idx = column_indices[column]
+                    if value:
+                        row[idx] = value
+                    elif overwrite:
+                        row[idx] = value
+                if progress:
+                    progress.advance()
+
+    if progress:
+        progress.finish()
+        processed = progress.completed
+    else:
+        processed = 0
 
     destination = output_path or input_path
     with destination.open("w", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
-        writer.writerows(reader)
+        writer.writerows(rows)
 
-    logging.info(
-        "Finished updating %s entries. Output written to %s.",
-        processed,
-        destination,
-    )
+    if processed:
+        logging.info(
+            "Finished updating %s entries. Output written to %s.",
+            processed,
+            destination,
+        )
+    else:
+        logging.info("No rows required updates. Data copied to %s.", destination)
+
+    return processed
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -290,13 +424,24 @@ def main(argv: Optional[List[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s",
     )
 
-    output_path = args.output if args.output else None
+    if args.output:
+        output_path = args.output
+    else:
+        suffix = "-assign-formal-cats"
+        if args.input.suffix:
+            output_path = args.input.with_name(
+                f"{args.input.stem}{suffix}{args.input.suffix}"
+            )
+        else:
+            output_path = args.input.with_name(f"{args.input.name}{suffix}")
 
     try:
         update_csv(
             args.input,
             output_path,
             sleep_seconds=args.sleep,
+            workers=args.workers,
+            progress_interval=args.progress_interval,
             max_retries=args.max_retries,
             overwrite=args.overwrite,
             cache_dir=args.cache_dir,
